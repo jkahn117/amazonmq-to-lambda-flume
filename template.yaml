@@ -1,0 +1,491 @@
+---
+
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+
+Description: "Sample: Invoking AWS Lambda from AmazonMQ queue"
+
+#
+# ---------- Parameters ----------
+#
+Parameters:
+  AmazonMQHost:
+    Type: String
+    Default: ''
+    Description: Host name of your Amazon MQ instance
+
+  AmazonMQLogin:
+    Type: String
+    Default: ''
+    Description: Login / username for your Amazon MQ instance
+
+  AmazonMQPassword:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Password for your Amazon MQ instance
+
+  DefaultVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID of the Default VPC in desired Region
+
+  DefaultSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Default Security Group ID in desired Region (Amazon MQ brokers launch in this SG)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: 'flume'
+    Description: Keypair for this EC2 instance
+
+  SSHLocation:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed to access Flume instance via SSH
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+
+#
+# ---------- Mappings ----------
+# 
+# amzn-ami-hvm-2017.09.1.20171103-x86_64-gp2
+# aws ec2 describe-images --filters "Name=name,Values=amzn-ami-hvm-2017.09.1.20171103-x86_64-gp2" --query "Images[0].ImageId" --region=us-east-1
+Mappings: 
+  RegionMap: 
+    us-east-1:
+      AMI: 'ami-6057e21a'
+    us-east-2:
+      AMI: 'ami-aa1b34cf'
+    us-west-1:
+      AMI: 'ami-1a033c7a'
+    us-west-2:
+      AMI: 'ami-32d8124a'
+    eu-west-1:
+      AMI: 'ami-760aaa0f'
+    eu-central-1:
+      AMI: 'ami-e28d098d'
+    ap-northeast-1:
+      AMI: 'ami-2803ac4e'
+    ap-northeast-2:
+      AMI: 'ami-fc862292'
+    ap-southeast-1:
+      AMI: 'ami-dd7935be'
+    ap-southeast-2:
+      AMI: 'ami-1a668878'
+    sa-east-1:
+      AMI: 'ami-1678037a'
+
+#
+# ---------- Resources ----------
+#
+Resources:
+  #
+  # ---------- Flume Sink Function ----------
+  #
+  FlumeSinkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: flume/
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Role: !GetAtt FlumeSinkFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref MessageTable
+
+  #
+  # ---------- Flume EC2 Instance ----------
+  #
+  FlumeInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default:
+            - install
+            - plugins
+            - configure
+        install:
+          packages:
+            yum:
+              'java-1.8.0-openjdk-devel.x86_64': []
+          sources:
+            '/home/ec2-user/stompjms': 'https://github.com/fusesource/stompjms/tarball/stompjms-project-1.19'
+            '/home/ec2-user/flume-aws-lambda': 'https://github.com/jkahn117/flume-aws-lambda/tarball/master'
+            '/home/ec2-user/apache-maven-3.5.2': 'http://download.nextag.com/apache/maven/maven-3/3.5.2/binaries/apache-maven-3.5.2-bin.tar.gz'
+            '/home/ec2-user/apache-flume-1.8.0': 'http://download.nextag.com/apache/flume/1.8.0/apache-flume-1.8.0-bin.tar.gz'
+          files:
+            # env variables
+            '/usr/local/bin/configure-env-variables.sh':
+              content: !Sub |
+                #!/bin/bash -xe
+                cd /home/ec2-user
+                mv apache-maven-3.5.2/apache-maven-3.5.2 maven && rm -rf apache-maven-3.5.2
+                mv apache-flume-1.8.0/apache-flume-1.8.0-bin flume && rm -rf apache-flume-1.8.0
+                # update to Java 8
+                alternatives --set java /usr/lib/jvm/jre-1.8.0-openjdk.x86_64/bin/java
+                alternatives --remove java /usr/lib/jvm/jre-1.7.0-openjdk.x86_64/bin/java
+                # set environment variables
+                echo FLUME_HOME=/home/ec2-user/flume >> /etc/bashrc
+                echo M2_HOME=/home/ec2-user/maven >> /etc/bashrc
+                echo M2=\$\{M2_HOME\}/bin >> /etc/bashrc
+                echo PATH=\$M2:\$\{PATH\} >> /etc/bashrc
+                echo JAVA_HOME=/usr/lib/jvm/jre-1.8.0-openjdk.x86_64 >> /etc/bashrc
+              mode: '000755'
+              owner: root
+              group: root
+          commands:
+            01-config-env-variables:
+              command: '/usr/local/bin/configure-env-variables.sh'
+            02-adjust-user-permissions:
+              command: 'cd /home/ec2-user && chown -R ec2-user:ec2-user .'
+        plugins:
+          files:
+            # download and install flume
+            '/usr/local/bin/install-flume-plugins.sh':
+              content: !Sub |
+                #!/bin/bash -xe
+                echo $M2
+                cd /home/ec2-user
+                mkdir flume/plugins.d
+                mkdir flume/plugins.d/stompjms-client && mkdir flume/plugins.d/stompjms-client/lib
+                mkdir flume/plugins.d/flume-aws-lambda && mkdir flume/plugins.d/flume-aws-lambda/lib
+                # install Flume plugins
+                cd /home/ec2-user/stompjms
+                /home/ec2-user/maven/bin/mvn -pl stompjms-client
+                cp stompjms-client/target/stompjms-client-1.19-uber.jar /home/ec2-user/flume/plugins.d/stompjms-client/lib
+                cd /home/ec2-user/flume-aws-lambda
+                /home/ec2-user/maven/bin/mvn package shade:shade
+                cp target/flume-aws-lambda-0.0.1-SNAPSHOT.jar /home/ec2-user/flume/plugins.d/flume-aws-lambda/lib
+              mode: '000755'
+              owner: root
+              group: root
+          commands:
+            01-install-plugins:
+              command: '/usr/local/bin/install-flume-plugins.sh'
+              env:
+                M2_HOME: /home/ec2-user/maven
+                M2: ${M2_HOME}/bin
+                JAVA_HOME: /usr/lib/jvm/jre-1.8.0-openjdk.x86_64
+            02-adjust-user-permissions:
+              command: 'cd /home/ec2-user && chown -R ec2-user:ec2-user .'
+        configure:
+          files:
+            # flume configuration
+            '/home/ec2-user/flume/conf/amazonmq-conf.properties':
+              content: !Sub |
+                a1.sources = r1
+                a1.sinks = k1
+                a1.channels = c1
+                # configure the source -- amazonmq
+                a1.sources.r1.type = jms
+                a1.sources.r1.initialContextFactory = org.fusesource.stomp.jms.jndi.StompJmsInitialContextFactory
+                a1.sources.r1.connectionFactory = QueueConnectionFactory
+                a1.sources.r1.providerURL = ${AmazonMQHost}
+                a1.sources.r1.destinationName = SAMPLE_QUEUE
+                a1.sources.r1.destinationType = QUEUE
+                a1.sources.r1.userName = master
+                a1.sources.r1.passwordFile = /home/ec2-user/flume/conf/password.txt
+                # configure the sink -- kinesis
+                a1.sinks.k1.type = com.jkahn.flume.sink.aws.lambda.LambdaSink
+                a1.sinks.k1.region = ${AWS::Region}
+                a1.sinks.k1.functionName = ${FlumeSinkFunction}
+                # channel buffer in memory
+                a1.channels.c1.type = memory
+                a1.channels.c1.capacity = 1000
+                a1.channels.c1.transactionCapacity = 100
+                # bind the source and sink to the channel
+                a1.sources.r1.channels = c1
+                a1.sinks.k1.channel = c1
+            # flume - activemq password
+            '/home/ec2-user/flume/conf/password.txt':
+              content: !Sub |
+                ${AmazonMQPassword}
+            # cfn-hup
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: 000400
+              owner: root
+              group: root
+            # cfn-auto-reload
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.EC2Instance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource FlumeInstance --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - '/etc/cfn/cfn-hup.conf'
+                  - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+    Properties:
+      ImageId: !FindInMap [ RegionMap, !Ref 'AWS::Region', AMI ]
+      InstanceType: 't2.small'
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref FlumeInstanceProfile
+      NetworkInterfaces:
+        -
+          AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref FlumeInstanceSecurityGroup
+      Tags:
+        -
+          Key: 'Name'
+          Value: 'Flume - AmazonMQ to Lambda'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          yum update -y
+          yum update -y aws-cfn-bootstrap
+          # setup the instance
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource FlumeInstance --region ${AWS::Region}
+          # signal status
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource FlumeInstance --region ${AWS::Region}
+          # start flume
+          export FLUME_HOME=/home/ec2-user/flume
+          cd /home/ec2-user/flume
+          bin/flume-ng agent --conf conf --conf-file conf/amazonmq-conf.properties --name a1 -Dflume.root.logger=INFO,console
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+
+  FlumeInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AmazonMQ+Lambda - Flume Instance Security Group
+      GroupDescription: AmazonMQ+Lambda - Flume Instance Security Group, allows SSH from admin
+      VpcId: !Ref DefaultVpcId
+      SecurityGroupIngress:
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref SSHLocation
+
+  BrokerSGIngressFromFlume:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DefaultSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 61614
+      ToPort: 61614
+      SourceSecurityGroupId: !GetAtt FlumeInstanceSecurityGroup.GroupId
+
+  BrokerSGIngressFromAdmin:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DefaultSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref SSHLocation
+
+  #
+  # ---------- DynamoDB Table ----------
+  #
+  MessageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'amazonmq-sample'
+      AttributeDefinitions:
+        -
+          AttributeName: uuid
+          AttributeType: S
+      KeySchema:
+        -
+          AttributeName: uuid
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+
+  #
+  # ---------- Publisher Function ----------
+  # Demonstrates how to public from Lambda to AmazonMQ broker via STOMP.
+  # 
+  # PublisherFunction:
+  #   Type: AWS::Serverless::Function
+  #   Properties:
+  #     CodeUri: publisher/
+  #     Handler: index.handler
+  #     Runtime: nodejs6.10
+  #     Environment:
+  #       Variables:
+  #         HOST: !Ref AmazonMQHost
+  #         PORT: '61614'
+  #         LOGIN: !Ref AmazonMQLogin
+  #         PASSCODE: !Ref AmazonMQPassword
+  #     Events:
+  #       PutEvent:
+  #         Type: Api
+  #         Properties:
+  #           Path: /publish
+  #           Method: PUT
+
+
+  #
+  # ---------- Consumer Function ----------
+  # Demonstrates how to read a single message from broker via STOMP.
+  #
+  # ConsumerFunction:
+  #   Type: AWS::Serverless::Function
+  #   Properties:
+  #     CodeUri: consumer/
+  #     Handler: index.handler
+  #     Runtime: nodejs6.10
+  #     Environment:
+  #       Variables:
+  #         HOST: !Ref AmazonMQHost
+  #         PORT: '61614'
+  #         LOGIN: !Ref AmazonMQLogin
+  #         PASSCODE: !Ref AmazonMQPassword
+  #     Events:
+  #       PutEvent:
+  #         Type: Api
+  #         Properties:
+  #           Path: /list
+  #           Method: GET
+
+  #
+  # ---------- Kinesis Function ----------
+  # For higher volume of messages from Flume, may wish to read
+  # from a Kinesis Stream.
+  #
+  # KinesisFunction:
+  #   Type: AWS::Serverless::Function
+  #   Properties:
+  #     CodeUri: kinesis/
+  #     Handler: index.handler
+  #     Runtime: nodejs6.10
+  #     Environment:
+  #       Variables:
+  #         TABLE_NAME: !Ref MessageTable
+  #     Events:
+  #       StreamEvent:
+  #         Type: Kinesis
+  #         Properties:
+  #           Stream: !GetAtt KinesisStream.Arn
+  #           StartingPosition: TRIM_HORIZON
+  #           
+  # Kinesis Stream
+  #
+  # KinesisStream:
+  #   Type: AWS::Kinesis::Stream
+  #   Properties:
+  #     Name: 'amazonmq-stream'
+  #     ShardCount: 1
+
+
+  #
+  # ---------- IAM ----------
+  #
+  FlumeSinkFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/AmazonMQ/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: AllowLambdaServiceToAssumeRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+
+  FlumeSinkFunctionPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: FlumeSinkFunctionRole
+    Properties:
+      PolicyName: FlumeSinkFunctionPolicy
+      Roles:
+        - !Ref FlumeSinkFunctionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Resource: !GetAtt MessageTable.Arn
+            Action:
+              - "dynamodb:PutItem"
+  
+  ## EC2 Role & Instance Profile ##
+  FlumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/AmazonMQ/'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Principal:
+              Service: 
+                - ec2.amazonaws.com
+
+  FlumeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/AmazonMQ/'
+      Roles:
+        - !Ref FlumeRole
+
+  # FlumeKinesisPolicy:
+  #   Type: AWS::IAM::Policy
+  #   DependsOn: FlumeRole
+  #   Properties:
+  #     PolicyName: 'FlumeKinesisPolicy'
+  #     Roles:
+  #       - !Ref FlumeRole
+  #     PolicyDocument:
+  #       Version: "2012-10-17"
+  #       Statement:
+  #         -
+  #           Effect: Allow
+  #           Resource: !GetAtt KinesisStream.Arn
+  #           Action:
+  #             - 'kinesis:PutRecord'
+  #             - 'kinesis:PutRecords'
+
+  FlumeLambdaPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: FlumeRole
+    Properties:
+      PolicyName: 'FlumeLambdaPolicy'
+      Roles:
+        - !Ref FlumeRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: Allow
+            Resource: !GetAtt FlumeSinkFunction.Arn
+            Action:
+              - 'lambda:InvokeFunction'
+
+#
+# ---------- Outputs ----------
+#
+Outputs:
+  FlumeInstanceIP:
+    Description: Flume Instance Public IP
+    Value: !GetAtt FlumeInstance.PublicIp
+
+  FlumeInstanceDNS:
+    Description: Flume Instance Public DNS
+    Value: !GetAtt FlumeInstance.PublicDnsName

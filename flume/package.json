@@ -1,0 +1,11 @@
+{
+  "name": "aws-venturi-flume",
+  "version": "1.0.0",
+  "description": "Test function for aws-flume-sink",
+  "main": "index.js",
+  "author": "jkahn@",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "uuid": "^3.1.0"
+  }
+}
